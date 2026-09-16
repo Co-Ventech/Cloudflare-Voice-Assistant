@@ -1,0 +1,31 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cf-voice-agent",
+  "compatibility_date": "2026-09-04",
+  "compatibility_flags": ["nodejs_compat"],
+  "main": "vinext/server/fetch-handler",
+  "assets": {
+    "directory": "dist/client",
+    "not_found_handling": "none",
+    "binding": "ASSETS"
+  },
+  "cache": {
+    "enabled": true
+  },
+  "images": {
+    "binding": "IMAGES"
+  },
+  "kv_namespaces": [
+    {
+      "binding": "VINEXT_KV_CACHE",
+      "id": "7a79edbed9a347fe8d416d85d32d2c73"
+    },
+    {
+      "binding": "VOICE_KV",
+      "id": "1166f3835da64989a7a92afa5dddef96"
+    }
+  ],
+  "ai": {
+    "binding": "AI"
+  }
+}
