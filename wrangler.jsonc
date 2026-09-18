@@ -3,29 +3,34 @@
   "name": "cf-voice-agent",
   "compatibility_date": "2026-09-04",
   "compatibility_flags": ["nodejs_compat"],
-  "main": "vinext/server/fetch-handler",
-  "assets": {
-    "directory": "dist/client",
-    "not_found_handling": "none",
-    "binding": "ASSETS"
-  },
-  "cache": {
-    "enabled": true
-  },
-  "images": {
-    "binding": "IMAGES"
+  "main": "src/server.ts",
+  "ai": {
+    "binding": "AI",
+    "remote": true
   },
   "kv_namespaces": [
     {
-      "binding": "VINEXT_KV_CACHE",
-      "id": "7a79edbed9a347fe8d416d85d32d2c73"
-    },
-    {
       "binding": "VOICE_KV",
-      "id": "1166f3835da64989a7a92afa5dddef96"
+      "id": "<YOUR_KV_NAMESPACE_ID>"
     }
   ],
-  "ai": {
-    "binding": "AI"
+  "durable_objects": {
+    "bindings": [
+      {
+        "class_name": "MyVoiceAgent",
+        "name": "MyVoiceAgent"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["MyVoiceAgent"]
+    }
+  ],
+  "assets": {
+    "directory": "dist/client",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/agents/*"]
   }
 }
