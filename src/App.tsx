@@ -1,14 +1,42 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useVoiceAgent, type VoiceStatus } from "agents/voice/react";
-import { AURA_SPEAKERS, DEFAULT_SPEAKER, LLM_MODELS, DEFAULT_LLM, modelSupportsTools, type LlmKey, type AuraSpeakerId } from "../lib/voice";
+import {
+  AURA_SPEAKERS,
+  DEFAULT_SPEAKER,
+  LLM_MODELS,
+  DEFAULT_UI_LLM,
+  modelSupportsTools,
+  isLlmKey,
+  isSpeakerId,
+  type LlmKey,
+  type AuraSpeakerId,
+} from "../lib/voice";
 import { log, throttledLog, subscribeLog, type LogEntry } from "./lib/client-logger";
+
+// localStorage can throw (private windows, blocked site data) — and used to
+// crash the whole page on first render. Reads/writes are best-effort now.
+function readStored(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeStored(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    /* preference simply won't persist */
+  }
+}
 
 function getSessionId(): string {
   const KEY = "voice-agent-session-id";
-  let id = localStorage.getItem(KEY);
+  let id = readStored(KEY);
   if (!id) {
     id = crypto.randomUUID();
-    localStorage.setItem(KEY, id);
+    writeStored(KEY, id);
   }
   return id;
 }
@@ -21,36 +49,47 @@ const SPEAKING_THRESHOLD = 0.045;
 
 // The UI's own honest state machine. `status` from the hook only reflects
 // what the *server* has confirmed (it stays "idle" for the brief window
-// between clicking the orb and the server acknowledging start_call) — so we
-// layer `starting` (local, set the instant the user clicks) on top of it.
-// This is also the fix for the original bug: the call-active/inactive
-// decision now comes from this, never from the raw `connected` flag (which
-// only means "the WebSocket is open" and was already true before the user
-// ever clicked anything).
+// between clicking the button and the server acknowledging start_call) — so
+// we layer `starting` (local, set the instant the user clicks) on top of it.
+// The call-active/inactive decision comes from this, never from the raw
+// `connected` flag (which only means "the WebSocket is open" and is already
+// true before the user ever clicks anything).
 type UiPhase = "idle" | "connecting" | "listening" | "you_are_speaking" | "thinking" | "speaking";
 
 const PHASE_LABEL: Record<UiPhase, string> = {
-  idle: "tap to start talking",
-  connecting: "connecting…",
-  listening: "listening…",
-  you_are_speaking: "you're speaking",
-  thinking: "thinking…",
-  speaking: "speaking…",
+  idle: "Ready when you are",
+  connecting: "Connecting…",
+  listening: "Listening",
+  you_are_speaking: "Hearing you",
+  thinking: "Thinking…",
+  speaking: "Speaking",
 };
 
 const LLM_LABELS: Record<LlmKey, string> = {
-  fastest: "Fastest · Llama 3.2 1B",
-  balanced: "Balanced · DeepSeek V4 Flash",
-  quality: "Quality · GPT-OSS 20B",
+  fastest: "Fastest: Llama 3.2 1B",
+  deepseek: "DeepSeek direct API: fast and smart",
+  balanced: "Balanced: DeepSeek V4 Flash",
+  quality: "Quality: GPT-OSS 20B",
 };
 
 // Short, model-specific reason shown under the (disabled) tools checkbox —
 // see lib/voice.ts LLM_TOOL_SUPPORT for how this was determined.
 const TOOLS_UNSUPPORTED_REASON: Record<LlmKey, string> = {
-  fastest: "Llama 3.2 1B doesn't support tool calling — switch to Balanced or Quality to use tools.",
+  fastest: "Llama 3.2 1B can't use tools. Pick DeepSeek, Balanced or Quality to turn them on.",
+  deepseek: "",
   balanced: "",
   quality: "",
 };
+
+// Fixed pseudo-random per-bar weights so the waveform has a natural,
+// non-uniform shape that doesn't reshuffle on every render.
+const BAR_COUNT = 48;
+const BAR_WEIGHTS = Array.from({ length: BAR_COUNT }, (_, i) => {
+  const x = Math.sin(i * 12.9898) * 43758.5453;
+  return 0.35 + 0.65 * (x - Math.floor(x));
+});
+
+type StageTheme = "idle" | "listening" | "thinking" | "speaking";
 
 function formatTime(ms: number): string {
   const d = new Date(ms);
@@ -59,7 +98,7 @@ function formatTime(ms: number): string {
 
 /** Off-by-default activity panel: recent client log lines + live connection
  * state, so a broken capture path is visible in the app itself instead of
- * requiring DevTools. Toggled by the "debug" link at the bottom of the page. */
+ * requiring DevTools. Toggled by the "Debug" link in the top bar. */
 function DebugPanel(props: {
   connected: boolean;
   status: VoiceStatus;
@@ -77,55 +116,76 @@ function DebugPanel(props: {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight });
   }, [entries]);
 
-  const levelColor: Record<LogEntry["level"], string> = {
-    info: "text-[var(--ink-dim)]",
-    warn: "text-[var(--amber)]",
-    error: "text-[var(--err)]",
-  };
-
   return (
-    <div className="glass fade-in-up mt-3 w-full rounded-2xl p-4 text-xs">
-      <p className="mb-2 text-[11px] tracking-[0.15em] text-[var(--ink-dim)] uppercase">Activity</p>
-      <div className="mb-3 grid grid-cols-2 gap-x-4 gap-y-1 font-[family-name:var(--font-mono)] text-[11px] text-[var(--ink-dim)] sm:grid-cols-3">
-        <span>ws: {props.connected ? "open" : "closed"}</span>
-        <span>status: {props.status}</span>
-        <span>starting: {String(props.starting)}</span>
-        <span>mic level: {props.audioLevel.toFixed(3)}</span>
-        <span>muted: {String(props.isMuted)}</span>
-        <span className={props.error ? "text-[var(--err)]" : ""}>error: {props.error ?? "none"}</span>
-        {props.outputDeviceError ? <span className="text-[var(--amber)]">output: {props.outputDeviceError}</span> : null}
-      </div>
-      <div ref={listRef} className="transcript-scroll max-h-48 overflow-y-auto rounded-lg border border-[var(--border)] bg-black/20 p-2 font-[family-name:var(--font-mono)]">
+    <section className="debug" aria-label="Activity">
+      <dl>
+        <div>
+          <dt>Socket</dt>
+          <dd>{props.connected ? "open" : "closed"}</dd>
+        </div>
+        <div>
+          <dt>Status</dt>
+          <dd>{props.status}</dd>
+        </div>
+        <div>
+          <dt>Starting</dt>
+          <dd>{String(props.starting)}</dd>
+        </div>
+        <div>
+          <dt>Mic level</dt>
+          <dd>{props.audioLevel.toFixed(3)}</dd>
+        </div>
+        <div>
+          <dt>Muted</dt>
+          <dd>{String(props.isMuted)}</dd>
+        </div>
+        <div>
+          <dt>Error</dt>
+          <dd>{props.error ?? "none"}</dd>
+        </div>
+        {props.outputDeviceError ? (
+          <div>
+            <dt>Output</dt>
+            <dd>{props.outputDeviceError}</dd>
+          </div>
+        ) : null}
+      </dl>
+      <div ref={listRef} className="debug-log scroll-thin">
         {entries.length === 0 ? (
-          <p className="text-[var(--ink-dim)]/60">no activity yet</p>
+          <p>No activity yet.</p>
         ) : (
           entries.map((e, i) => (
-            <p key={i} className={`${levelColor[e.level]} whitespace-pre-wrap break-words`}>
-              <span className="text-[var(--ink-dim)]/50">{formatTime(e.time)}</span> {e.message}
+            <p key={i} className={e.level}>
+              <span style={{ opacity: 0.6 }}>{formatTime(e.time)}</span> {e.message}
             </p>
           ))
         )}
       </div>
-    </div>
+    </section>
   );
 }
 
 export default function App() {
   const sessionId = useMemo(getSessionId, []);
+  // Stored values are validated: a stale or hand-edited value (for example a
+  // model that no longer exists) used to leave the picker blank and the
+  // label lookup undefined.
   const [speaker, setSpeaker] = useState<AuraSpeakerId>(() => {
-    return (localStorage.getItem("voice-agent-speaker") as AuraSpeakerId) || DEFAULT_SPEAKER;
+    const stored = readStored("voice-agent-speaker");
+    return isSpeakerId(stored) ? stored : DEFAULT_SPEAKER;
   });
   const [llm, setLlm] = useState<LlmKey>(() => {
-    return (localStorage.getItem("voice-agent-llm") as LlmKey) || DEFAULT_LLM;
+    const stored = readStored("voice-agent-llm");
+    return isLlmKey(stored) ? stored : DEFAULT_UI_LLM;
   });
   const [toolsEnabled, setToolsEnabled] = useState<boolean>(() => {
-    return localStorage.getItem("voice-agent-tools") === "1";
+    return readStored("voice-agent-tools") === "1";
   });
   const [showDebug, setShowDebug] = useState(false);
 
-  useEffect(() => localStorage.setItem("voice-agent-speaker", speaker), [speaker]);
-  useEffect(() => localStorage.setItem("voice-agent-llm", llm), [llm]);
-  useEffect(() => localStorage.setItem("voice-agent-tools", toolsEnabled ? "1" : "0"), [toolsEnabled]);
+  useEffect(() => writeStored("voice-agent-speaker", speaker), [speaker]);
+  useEffect(() => writeStored("voice-agent-llm", llm), [llm]);
+  useEffect(() => writeStored("voice-agent-tools", toolsEnabled ? "1" : "0"), [toolsEnabled]);
 
   // Whether the *selected* model supports structured tool calling at all
   // (lib/voice.ts LLM_TOOL_SUPPORT, verified empirically — see README). The
@@ -162,12 +222,11 @@ export default function App() {
     query: { llm, speaker, tools: effectiveToolsEnabled ? "1" : "0" },
   });
 
-  // Local "did the user ask to start a call" flag. Set the instant the orb
+  // Local "did the user ask to start a call" flag. Set the instant the button
   // is clicked, cleared once the server confirms (status leaves "idle") or
   // an error/end arrives. This closes the gap between "clicked start" and
   // "server acknowledged" with an honest "connecting…" state instead of
-  // silence, and — combined with never reading `connected` for call state —
-  // is the fix for the original bug (see callActive below).
+  // silence.
   const [starting, setStarting] = useState(false);
 
   const prevStatusRef = useRef<VoiceStatus>(status);
@@ -221,15 +280,11 @@ export default function App() {
     }
   }, [audioLevel, status, starting, isMuted]);
 
-  // The call is "active" — and the orb should show the stop icon — the
-  // instant the user asks to start, through to the server confirming a
-  // non-idle status. This intentionally ignores `connected` (WebSocket
-  // open/closed), which is unrelated to whether a call is in progress: the
-  // WebSocket opens automatically on page load, long before anyone clicks
-  // anything, so using it for the button's state was the original bug — the
-  // orb rendered as "active" immediately on load and the very first click
-  // called endCall() instead of startCall(), meaning getUserMedia was never
-  // invoked.
+  // The call is "active" — and the button shows "End call" — the instant the
+  // user asks to start, through to the server confirming a non-idle status.
+  // This intentionally ignores `connected` (WebSocket open/closed), which is
+  // unrelated to whether a call is in progress: the WebSocket opens
+  // automatically on page load, long before anyone clicks anything.
   const callActive = starting || status !== "idle";
 
   const phase: UiPhase = !connected
@@ -246,7 +301,7 @@ export default function App() {
             ? "speaking"
             : "idle";
 
-  const handleOrbClick = () => {
+  const handleCallClick = () => {
     if (callActive) {
       log("info", "user clicked: end call");
       setStarting(false);
@@ -272,245 +327,257 @@ export default function App() {
     toggleMute();
   };
 
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const turnsRef = useRef<HTMLUListElement>(null);
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-  }, [transcript, interimTranscript]);
+    turnsRef.current?.scrollTo({ top: turnsRef.current.scrollHeight, behavior: "smooth" });
+  }, [transcript]);
 
-  const isActive = phase !== "idle" && phase !== "connecting";
-  // Meter fill (0-1): audioLevel is raw RMS, typically well under 1 for
-  // normal speech, so scale it up for a meter that actually visibly moves.
+  // Page theme follows the call: red while your microphone is live, black
+  // while the assistant is speaking, concrete otherwise.
+  const theme: StageTheme =
+    phase === "listening" || phase === "you_are_speaking"
+      ? "listening"
+      : phase === "speaking"
+        ? "speaking"
+        : phase === "thinking"
+          ? "thinking"
+          : "idle";
+
+  // Level for the waveform (0-1): audioLevel is raw RMS, typically well under
+  // 1 for normal speech, so scale it up so the bars visibly move.
   const level = Math.min(1, audioLevel * 3.2);
   const latencyMs = turnMetrics?.turnTotalMs;
-  const meterBars = 12;
-  const litBars = Math.round(level * meterBars);
-
   const combinedError = error ?? outputDeviceError;
 
+  // The hero is whatever is being said right now, shown huge like subtitles.
+  const lastUser = [...transcript].reverse().find((t) => t.role === "user");
+  const lastAssistant = [...transcript].reverse().find((t) => t.role === "assistant");
+  const lastTurn = transcript[transcript.length - 1];
+  let heroText: string;
+  let heroWho: string;
+  let heroRole: "hint" | "interim" | "text";
+  if (interimTranscript) {
+    heroText = interimTranscript;
+    heroWho = "You";
+    heroRole = "interim";
+  } else if (phase === "speaking" && lastAssistant) {
+    heroText = lastAssistant.text;
+    heroWho = "Assistant";
+    heroRole = "text";
+  } else if (phase === "thinking") {
+    heroText = lastUser?.text ?? "Thinking…";
+    heroWho = "You said";
+    heroRole = "text";
+  } else if (callActive && (phase === "listening" || phase === "you_are_speaking")) {
+    heroText = "Go ahead, I'm listening.";
+    heroWho = "Microphone is live";
+    heroRole = "hint";
+  } else if (callActive) {
+    heroText = "Starting the call…";
+    heroWho = "One moment";
+    heroRole = "hint";
+  } else if (lastTurn) {
+    heroText = lastTurn.text;
+    heroWho = lastTurn.role === "user" ? "You said" : "Assistant said";
+    heroRole = "text";
+  } else {
+    heroText = "Say something.";
+    heroWho = "Voice assistant";
+    heroRole = "hint";
+  }
+
+  const downloadTranscript = () => {
+    const body = transcript.map((t) => `${t.role === "user" ? "You" : "Assistant"}: ${t.text}`).join("\n\n");
+    const blob = new Blob([body + "\n"], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `voice-transcript-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const callLabel = callActive ? "End call" : !connected ? "Connecting…" : "Start talking";
+
   return (
-    <main className="relative z-10 mx-auto flex min-h-screen max-w-2xl flex-col items-center px-6 py-14">
-      {/* Header */}
-      <div className="flex w-full flex-col items-center text-center">
-        <p className="text-xs tracking-[0.3em] text-[var(--accent)] uppercase">workers ai · realtime voice agent</p>
-        <h1 className="mt-3 font-[family-name:var(--font-display)] text-4xl font-extrabold tracking-tight text-[var(--ink)] sm:text-5xl">
-          Just start talking.
-        </h1>
-        <p className="mt-3 max-w-md text-sm leading-relaxed text-[var(--ink-dim)]">
-          Streaming speech-to-text detects when you're done — no button to hold. One WebSocket carries audio in,
-          transcript and speech back out, all inside a single Durable Object.
-        </p>
-      </div>
+    <div className="stage" data-theme={theme}>
+      <div className="stage-inner">
+        <header className="topbar">
+          <p className="wordmark">
+            <span className="rec-dot" aria-hidden />
+            voice
+          </p>
+          <button type="button" className="link-btn" onClick={() => setShowDebug((v) => !v)} aria-expanded={showDebug}>
+            {showDebug ? "Hide debug" : "Debug"}
+          </button>
+        </header>
 
-      {/* Orb */}
-      <div className="relative mt-12 flex h-44 w-44 items-center justify-center">
-        <span className={`orb-ring ${phase === "listening" || phase === "you_are_speaking" ? "active" : ""}`} />
-        <span className={`orb-ring ${phase === "listening" || phase === "you_are_speaking" ? "active" : ""}`} />
-        <span className={`orb-ring ${phase === "listening" || phase === "you_are_speaking" ? "active" : ""}`} />
+        <main className="hero" aria-live="polite">
+          <p className="hero-who">{heroWho}</p>
+          <h1 className="hero-text" data-role={heroRole} dir="auto">
+            {heroText}
+          </h1>
+        </main>
 
-        <button
-          type="button"
-          onClick={handleOrbClick}
-          disabled={!connected}
-          aria-label={callActive ? "End call" : "Start call"}
-          className="relative flex h-32 w-32 items-center justify-center rounded-full border transition-all disabled:cursor-not-allowed disabled:opacity-60"
-          style={{
-            borderColor: callActive ? "var(--accent)" : "var(--border-strong)",
-            background:
-              phase === "listening" || phase === "you_are_speaking"
-                ? `radial-gradient(circle at 50% 50%, color-mix(in srgb, var(--accent) ${20 + level * 55}%, transparent), rgba(20,41,38,0.6))`
-                : phase === "speaking"
-                  ? "radial-gradient(circle at 50% 50%, rgba(45,212,191,0.32), rgba(20,41,38,0.6))"
-                  : phase === "thinking"
-                    ? "radial-gradient(circle at 50% 50%, rgba(245,185,105,0.22), rgba(20,41,38,0.6))"
-                    : "var(--surface)",
-            boxShadow: callActive ? `0 0 ${30 + level * 60}px -10px var(--accent)` : "none",
-            transform: phase === "listening" || phase === "you_are_speaking" ? `scale(${1 + level * 0.08})` : "scale(1)",
-          }}
+        <div
+          className="wave"
+          data-mode={theme}
+          role="img"
+          aria-label={
+            theme === "listening" ? `Microphone level ${Math.round(level * 100)} percent` : `Assistant is ${PHASE_LABEL[phase].toLowerCase()}`
+          }
         >
-          {phase === "thinking" ? (
-            <svg className="think-spin h-9 w-9 text-[var(--amber)]" viewBox="0 0 24 24" fill="none">
-              <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="2" strokeDasharray="42 14" strokeLinecap="round" />
-            </svg>
-          ) : callActive ? (
-            <span className="h-8 w-8 rounded-md bg-[var(--accent)]" />
-          ) : (
-            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-[var(--ink)]">
-              <rect x="9" y="2" width="6" height="12" rx="3" />
-              <path d="M5 10a7 7 0 0 0 14 0" strokeLinecap="round" />
-              <line x1="12" y1="19" x2="12" y2="22" strokeLinecap="round" />
-            </svg>
-          )}
-        </button>
-      </div>
+          {BAR_WEIGHTS.map((w, i) => (
+            <span
+              key={i}
+              style={
+                theme === "listening"
+                  ? { height: `${6 + level * 94 * w}%` }
+                  : theme === "speaking" || theme === "thinking"
+                    ? { animationDelay: `${(i % 12) * 0.07}s`, animationDuration: `${0.6 + w * 0.6}s` }
+                    : undefined
+              }
+            />
+          ))}
+        </div>
 
-      <div className="mt-6 flex flex-col items-center gap-1">
-        <p className="flex items-center gap-2 text-sm text-[var(--ink-dim)]">
-          {isActive ? <span className="spin-dot h-1.5 w-1.5 rounded-full bg-[var(--accent)]" /> : null}
-          {PHASE_LABEL[phase]}
-        </p>
-        {latencyMs ? <p className="text-[11px] text-[var(--ink-dim)]/70">responded in {Math.round(latencyMs)}ms</p> : null}
-      </div>
+        <div className="controls">
+          <button
+            type="button"
+            className="btn-call"
+            onClick={handleCallClick}
+            // Only block *starting* while offline. If the socket drops mid-call
+            // the button used to become disabled too, leaving no way to end
+            // the call or stop the mic.
+            disabled={!connected && !callActive}
+          >
+            {callActive ? (
+              <svg width="20" height="20" viewBox="0 0 24 24" aria-hidden>
+                <rect x="5" y="5" width="14" height="14" rx="3" fill="currentColor" />
+              </svg>
+            ) : (
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" aria-hidden>
+                <rect x="9" y="2.5" width="6" height="12" rx="3" />
+                <path d="M5 10.5a7 7 0 0 0 14 0" strokeLinecap="round" />
+                <path d="M12 19v3" strokeLinecap="round" />
+              </svg>
+            )}
+            {callLabel}
+          </button>
 
-      {/* Live mic input-level meter — the single most important piece of
-          feedback here: it moves in real time with actual mic amplitude
-          (RMS computed from the AudioWorklet, the same signal that's
-          streamed to the server), so the user can see at a glance that
-          capture is actually working, independent of anything else. */}
-      {callActive ? (
-        <div className="fade-in-up mt-4 flex w-full max-w-xs flex-col items-center gap-1.5">
-          <div className="flex h-6 w-full items-end justify-center gap-[3px]" role="img" aria-label={`microphone input level ${Math.round(level * 100)}%`}>
-            {Array.from({ length: meterBars }).map((_, i) => (
-              <span
-                key={i}
-                className="w-full rounded-sm transition-colors"
-                style={{
-                  height: `${20 + (i / meterBars) * 80}%`,
-                  background: i < litBars ? (i > meterBars * 0.8 ? "var(--amber)" : "var(--accent)") : "var(--border)",
-                }}
-              />
-            ))}
-          </div>
-          <p className="text-[10px] tracking-[0.15em] text-[var(--ink-dim)]/70 uppercase">
-            {isMuted ? "muted" : `mic input ${Math.round(level * 100)}%`}
+          {callActive ? (
+            <button type="button" className="btn-outline" onClick={handleToggleMute}>
+              {isMuted ? "Unmute mic" : "Mute mic"}
+            </button>
+          ) : null}
+
+          <p className="meta" role="status">
+            {PHASE_LABEL[phase]}
+            {latencyMs ? ` — last reply took ${Math.round(latencyMs)} ms` : ""}
           </p>
         </div>
-      ) : null}
 
-      {callActive ? (
-        <button
-          type="button"
-          onClick={handleToggleMute}
-          className="mt-4 rounded-full border border-[var(--border)] px-4 py-1.5 text-xs text-[var(--ink-dim)] transition-colors hover:border-[var(--accent)] hover:text-[var(--ink)]"
-        >
-          {isMuted ? "unmute mic" : "mute mic"}
-        </button>
-      ) : null}
-
-      {combinedError ? (
-        <div className="fade-in-up mt-3 flex w-full max-w-md items-start gap-2 rounded-xl border border-[var(--err)]/40 bg-[var(--err)]/10 px-4 py-3">
-          <span className="mt-0.5 text-[var(--err)]">⚠</span>
-          <div className="text-sm text-[var(--err)]">
-            <p>{combinedError}</p>
-            {combinedError.toLowerCase().includes("microphone") ? (
-              <p className="mt-1 text-xs text-[var(--err)]/80">
-                Check your browser's site permissions (the icon left of the address bar) and allow microphone access, then tap the
-                orb again.
-              </p>
-            ) : combinedError.toLowerCase().includes("connect") ? (
-              <p className="mt-1 text-xs text-[var(--err)]/80">Check your network connection. The app will keep retrying automatically.</p>
-            ) : null}
+        {combinedError ? (
+          <div className="alert" role="alert">
+            <span aria-hidden>⚠</span>
+            <div>
+              <p style={{ margin: 0 }}>{combinedError}</p>
+              {combinedError.toLowerCase().includes("microphone") ? (
+                <small>
+                  Allow microphone access in your browser's site settings (the icon left of the address bar), then press
+                  Start talking again.
+                </small>
+              ) : combinedError.toLowerCase().includes("connect") ? (
+                <small>Check your network connection. The app keeps retrying automatically.</small>
+              ) : null}
+            </div>
           </div>
-        </div>
-      ) : null}
+        ) : null}
 
-      {/* Voice + model pickers */}
-      <div className="glass fade-in-up mt-10 grid w-full grid-cols-1 gap-4 rounded-2xl p-4 sm:grid-cols-2">
-        <label className="flex flex-col gap-1.5">
-          <span className="text-[11px] tracking-[0.15em] text-[var(--ink-dim)] uppercase">Aura voice</span>
-          <select
-            value={speaker}
-            onChange={(e) => setSpeaker(e.target.value as AuraSpeakerId)}
-            className="rounded-lg border border-[var(--border)] bg-[var(--surface-solid)] px-3 py-2 text-sm text-[var(--ink)] outline-none focus:border-[var(--accent)]"
-          >
-            {AURA_SPEAKERS.map((s) => (
-              <option key={s.id} value={s.id}>
-                {s.label} · {s.gender}
-              </option>
-            ))}
-          </select>
-        </label>
+        <section className="settings" aria-label="Call settings">
+          <div className="setting">
+            <label htmlFor="speaker">Voice</label>
+            <select
+              id="speaker"
+              className="select"
+              value={speaker}
+              onChange={(e) => setSpeaker(e.target.value as AuraSpeakerId)}
+            >
+              {AURA_SPEAKERS.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.label} ({s.gender})
+                </option>
+              ))}
+            </select>
+          </div>
 
-        <label className="flex flex-col gap-1.5">
-          <span className="text-[11px] tracking-[0.15em] text-[var(--ink-dim)] uppercase">Model</span>
-          <select
-            value={llm}
-            onChange={(e) => setLlm(e.target.value as LlmKey)}
-            className="rounded-lg border border-[var(--border)] bg-[var(--surface-solid)] px-3 py-2 text-sm text-[var(--ink)] outline-none focus:border-[var(--accent)]"
-          >
-            {(Object.keys(LLM_MODELS) as LlmKey[]).map((key) => (
-              <option key={key} value={key}>
-                {LLM_LABELS[key]}
-              </option>
-            ))}
-          </select>
-        </label>
+          <div className="setting">
+            <label htmlFor="llm">Model</label>
+            <select id="llm" className="select" value={llm} onChange={(e) => setLlm(e.target.value as LlmKey)}>
+              {(Object.keys(LLM_MODELS) as LlmKey[]).map((key) => (
+                <option key={key} value={key}>
+                  {LLM_LABELS[key]}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="setting">
+            <span className="label">Tools</span>
+            <label className="toggle" data-off={!toolsSupported} style={{ fontWeight: 500, marginBottom: 0 }}>
+              <input
+                type="checkbox"
+                checked={effectiveToolsEnabled}
+                disabled={!toolsSupported}
+                onChange={(e) => setToolsEnabled(e.target.checked)}
+              />
+              <span>
+                Let the assistant tell the time and set reminders
+                <span className="note" style={{ display: "block" }}>
+                  {toolsSupported ? "Adds about a second to replies that use a tool." : TOOLS_UNSUPPORTED_REASON[llm]}
+                </span>
+              </span>
+            </label>
+          </div>
+
+          {callActive ? (
+            <p className="note" style={{ gridColumn: "1 / -1", marginTop: 0 }}>
+              Changing the voice, model or tools reconnects the call.
+            </p>
+          ) : null}
+        </section>
+
+        {transcript.length > 0 ? (
+          <section className="transcript" aria-label="Conversation">
+            <div className="transcript-head">
+              <h2>Conversation</h2>
+              <button type="button" className="link-btn" onClick={downloadTranscript}>
+                Download as text
+              </button>
+            </div>
+            <ul ref={turnsRef} className="turns scroll-thin">
+              {transcript.map((turn, i) => (
+                <li key={i} className="turn" data-role={turn.role}>
+                  <span className="who">{turn.role === "user" ? "You" : "Assistant"}</span>
+                  <p dir="auto">{turn.text}</p>
+                </li>
+              ))}
+            </ul>
+          </section>
+        ) : null}
+
+        {showDebug ? (
+          <DebugPanel
+            connected={connected}
+            status={status}
+            starting={starting}
+            audioLevel={audioLevel}
+            isMuted={isMuted}
+            error={error}
+            outputDeviceError={outputDeviceError}
+          />
+        ) : null}
       </div>
-
-      <label
-        className={`glass fade-in-up mt-3 flex w-full items-center justify-between gap-3 rounded-2xl p-4 ${
-          toolsSupported ? "" : "opacity-70"
-        }`}
-      >
-        <span className="flex flex-col gap-0.5">
-          <span className="text-[11px] tracking-[0.15em] text-[var(--ink-dim)] uppercase">Tools</span>
-          <span className="text-xs text-[var(--ink-dim)]/70">
-            {toolsSupported
-              ? "time & reminders — off by default, costs a slower second round trip when used"
-              : TOOLS_UNSUPPORTED_REASON[llm]}
-          </span>
-        </span>
-        <input
-          type="checkbox"
-          checked={effectiveToolsEnabled}
-          disabled={!toolsSupported}
-          onChange={(e) => setToolsEnabled(e.target.checked)}
-          className="h-5 w-5 accent-[var(--accent)] disabled:cursor-not-allowed"
-        />
-      </label>
-
-      {callActive ? (
-        <p className="mt-2 text-center text-[11px] text-[var(--ink-dim)]/70">
-          changing voice, model, or tools reconnects the call
-        </p>
-      ) : null}
-
-      {/* Transcript */}
-      {transcript.length > 0 || interimTranscript ? (
-        <div className="fade-in-up mt-8 w-full">
-          <p className="text-xs tracking-[0.2em] text-[var(--ink-dim)] uppercase">transcript</p>
-          <div ref={scrollRef} className="transcript-scroll glass mt-3 flex max-h-96 flex-col gap-3 overflow-y-auto rounded-2xl p-4">
-            {transcript.map((turn, i) => (
-              <div
-                key={i}
-                className={`max-w-[85%] rounded-xl px-4 py-2.5 text-sm leading-relaxed ${
-                  turn.role === "user"
-                    ? "self-end bg-[var(--accent)]/15 text-[var(--ink)]"
-                    : "self-start border border-[var(--border)] text-[var(--ink-dim)]"
-                }`}
-              >
-                {turn.text}
-              </div>
-            ))}
-            {interimTranscript ? (
-              <div className="max-w-[85%] self-end rounded-xl px-4 py-2.5 text-sm leading-relaxed text-[var(--ink)]/50 italic">
-                {interimTranscript}
-              </div>
-            ) : null}
-          </div>
-        </div>
-      ) : null}
-
-      {/* Debug / activity panel — off by default. Answers "how do I know
-          it's listening" without needing DevTools: shows the same log lines
-          that go to the console, plus live connection state. */}
-      <button
-        type="button"
-        onClick={() => setShowDebug((v) => !v)}
-        className="mt-8 text-[11px] tracking-[0.1em] text-[var(--ink-dim)]/50 uppercase transition-colors hover:text-[var(--ink-dim)]"
-      >
-        {showDebug ? "hide debug" : "debug"}
-      </button>
-      {showDebug ? (
-        <DebugPanel
-          connected={connected}
-          status={status}
-          starting={starting}
-          audioLevel={audioLevel}
-          isMuted={isMuted}
-          error={error}
-          outputDeviceError={outputDeviceError}
-        />
-      ) : null}
-    </main>
+    </div>
   );
 }

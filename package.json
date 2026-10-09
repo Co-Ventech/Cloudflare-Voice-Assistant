@@ -12,8 +12,9 @@
     "types": "wrangler types worker-configuration.d.ts"
   },
   "dependencies": {
+    "@ai-sdk/deepseek": "^3.0.63",
     "agents": "^0.23.0",
-    "ai": "^7.0.102",
+    "ai": "^7.0.136",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "workers-ai-provider": "^4.0.0",

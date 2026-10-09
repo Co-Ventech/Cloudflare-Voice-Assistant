@@ -31,7 +31,11 @@ import { SentenceChunker } from "agents/voice";
 const SENTENCE_TERMINATORS = new Set([".", "!", "?"]);
 const CLAUSE_BOUNDARIES = new Set([",", ";", ":", "—"]);
 const MIN_SENTENCE_LENGTH = 10;
-export const MIN_FIRST_CHUNK_LENGTH = 40;
+// How long the first spoken piece must be before a comma/dash can end it. It was
+// 40 characters, which made short replies wait for the whole sentence before
+// any speech was requested. 24 starts speaking at the first natural pause
+// ("Sure, I can do that,") while still avoiding one-word fragments.
+export const MIN_FIRST_CHUNK_LENGTH = 24;
 
 interface ChunkerState {
   buffer: string;
@@ -77,7 +81,10 @@ export function extractChunks(state: ChunkerState): string[] {
   const out: string[] = [];
   while (true) {
     const allowClause = !state.emittedFirstChunk;
-    const boundary = findChunkBoundary(state.buffer, allowClause);
+    let boundary = findChunkBoundary(state.buffer, allowClause);
+    if (boundary === -1 && endsWithSentenceBoundary(state.buffer)) {
+      boundary = state.buffer.trimEnd().length - 1;
+    }
     if (boundary === -1) break;
     const piece = state.buffer.slice(0, boundary + 1).trim();
     state.buffer = state.buffer.slice(boundary + 1).trimStart();
@@ -87,6 +94,28 @@ export function extractChunks(state: ChunkerState): string[] {
     }
   }
   return out;
+}
+
+// A sentence that ENDS the buffer (no following character yet) used to wait
+// for the model stream to close before any speech was requested. In real use
+// the stream's tail (waiting for its "finish" event) took up to 4-5 seconds
+// after the last word, so a one-sentence reply was only spoken after the whole
+// stream ended (measured: first audio 6.1s vs first text 1.5s). A clean
+// sentence ending is safe to speak right away; abbreviations, decimals and
+// ellipses are not, because more text may follow them in the same sentence.
+const ABBREVIATION_END = /(?:^|[\s(])(?:mr|mrs|ms|dr|prof|sr|jr|st|vs|etc|e\.g|i\.e|no)\.$/i;
+
+export function endsWithSentenceBoundary(buffer: string): boolean {
+  const text = buffer.trimEnd();
+  if (text.length < MIN_SENTENCE_LENGTH) return false;
+  const last = text[text.length - 1];
+  if (last !== "." && last !== "!" && last !== "?") return false;
+  if (last === ".") {
+    if (text.endsWith("..") || text.endsWith("…")) return false; // ellipsis
+    if (/\d\.$/.test(text)) return false; // "3." might continue as "3.5"
+    if (ABBREVIATION_END.test(text)) return false;
+  }
+  return true;
 }
 
 let patched = false;

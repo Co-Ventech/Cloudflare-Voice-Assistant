@@ -16,12 +16,27 @@ import {
 } from "agents/voice";
 import { streamText, tool, isStepCount } from "ai";
 import { createWorkersAI } from "workers-ai-provider";
+import { createDeepSeek } from "@ai-sdk/deepseek";
 import { z } from "zod";
-import { SYSTEM_PROMPT, resolveLlmModel, resolveSpeaker, resolveToolsEnabled } from "../lib/voice";
+import {
+  SYSTEM_PROMPT,
+  resolveLlmModel,
+  resolveSpeaker,
+  resolveToolsEnabled,
+  formatDelay,
+  limitHistory,
+  MAX_LLM_HISTORY_MESSAGES,
+  MAX_REPLY_TOKENS,
+  reasoningSettingsFor,
+  usesDeepSeekDirect,
+  DEEPSEEK_DIRECT_MODEL,
+  DEEPSEEK_THINKING_OFF,
+} from "../lib/voice";
 import { checkRateLimit } from "../lib/ratelimit";
 import { getClientIp } from "../lib/clientinfo";
 import { patchSentenceChunkerForClauseStreaming } from "../lib/tts-chunking";
 import { guardToolCallLeakStream, TOOLCALL_LEAK_FALLBACK_REPLY, type LeakGuardChunk } from "../lib/toolcall-guard";
+import { withFirstChunkTimeout, STALL_TIMEOUT_MS, STALL_FALLBACK_REPLY } from "../lib/stall-guard";
 
 // See lib/tts-chunking.ts for why this patches the `agents` package instead
 // of using a config option (there isn't one). Applied once at module load.
@@ -30,6 +45,8 @@ patchSentenceChunkerForClauseStreaming();
 interface Env {
   AI: Ai;
   VOICE_KV: KVNamespace;
+  /** Optional secret for the "DeepSeek, direct API" model option. */
+  DEEPSEEK_API_KEY?: string;
   MyVoiceAgent: DurableObjectNamespace;
 }
 
@@ -186,13 +203,18 @@ export class MyVoiceAgent extends VoiceAgent<Env> {
         description: "Set a reminder that will be spoken aloud after a delay.",
         inputSchema: z.object({
           message: z.string().describe("The reminder message to speak to the user"),
-          delay_seconds: z.number().describe("How many seconds from now to trigger the reminder"),
+          // Bounded: a model can emit 0, negative or absurd values, which
+          // would either throw in schedule() or park a reminder for years.
+          delay_seconds: z
+            .number()
+            .min(1)
+            .max(86_400)
+            .describe("How many seconds from now to trigger the reminder (1 to 86400)"),
         }),
         execute: async ({ message, delay_seconds }: { message: string; delay_seconds: number }) => {
-          await this.schedule(delay_seconds, "speakReminder", { message });
-          const minutes = Math.round(delay_seconds / 60);
-          const timeLabel = minutes >= 1 ? `${minutes} minute${minutes > 1 ? "s" : ""}` : `${delay_seconds} seconds`;
-          return { confirmed: true, message, delay: timeLabel };
+          const delay = Math.round(delay_seconds);
+          await this.schedule(delay, "speakReminder", { message });
+          return { confirmed: true, message, delay: formatDelay(delay) };
         },
       }),
     };
@@ -202,7 +224,22 @@ export class MyVoiceAgent extends VoiceAgent<Env> {
     const workersAi = createWorkersAI({ binding: this.env.AI });
     const url = new URL(context.connection.uri ?? "http://localhost");
     const llmKey = url.searchParams.get("llm");
-    const llmModel = resolveLlmModel(llmKey);
+    // "DeepSeek, direct API" talks to DeepSeek's own endpoint with thinking
+    // switched off. Without the secret it falls back to the Cloudflare-hosted
+    // DeepSeek so a call never fails just because the key isn't set.
+    const wantsDirect = usesDeepSeekDirect(llmKey);
+    const directKey = this.env.DEEPSEEK_API_KEY;
+    const useDirect = wantsDirect && !!directKey;
+    const effectiveKey = wantsDirect && !directKey ? "balanced" : llmKey;
+    if (wantsDirect && !directKey) slog("llm.deepseek_direct.no_key", { fallback: "balanced" });
+    const llmModel = useDirect ? DEEPSEEK_DIRECT_MODEL : resolveLlmModel(effectiveKey);
+    const chatModel =
+      useDirect && directKey
+        ? createDeepSeek({ apiKey: directKey })(DEEPSEEK_DIRECT_MODEL)
+        : workersAi(llmModel as Parameters<typeof workersAi>[0], {
+            sessionAffinity: this.sessionAffinity,
+            ...reasoningSettingsFor(effectiveKey),
+          });
     // Server-side enforcement of "don't offer tools on models that can't do
     // them" (Task 3): resolveToolsEnabled already refuses tools for a model
     // lib/voice.ts knows doesn't support them, regardless of what the client
@@ -219,26 +256,33 @@ export class MyVoiceAgent extends VoiceAgent<Env> {
     });
 
     const messages = [
-      ...context.messages.map((m) => ({
+      ...limitHistory(context.messages, MAX_LLM_HISTORY_MESSAGES).map((m) => ({
         role: m.role as "user" | "assistant",
         content: m.content,
       })),
       { role: "user" as const, content: transcript },
     ];
 
+    // If the model request hangs (no error, no first word — seen in local
+    // development), cancel it and apologise out loud instead of leaving the
+    // user in silence. Also follows the library's own cancellation (barge-in).
+    const stall = new AbortController();
+    if (context.signal.aborted) stall.abort();
+    else context.signal.addEventListener("abort", () => stall.abort(), { once: true });
+
     // Shared by the primary call and the no-tools retry below (see
     // runLeakGuard's onLeak) so both go through identical logging/model
     // config, differing only in whether `tools` is attached.
     const runLlm = (withTools: boolean, label: string) =>
       streamText({
-        model: workersAi(llmModel as Parameters<typeof workersAi>[0], {
-          sessionAffinity: this.sessionAffinity,
-        }),
+        model: chatModel,
+        providerOptions: useDirect ? DEEPSEEK_THINKING_OFF : undefined,
         instructions: SYSTEM_PROMPT,
         messages,
+        maxOutputTokens: MAX_REPLY_TOKENS,
         tools: withTools ? this.buildTools() : undefined,
         stopWhen: isStepCount(3),
-        abortSignal: context.signal,
+        abortSignal: stall.signal,
         onFinish: ({ text, finishReason, totalUsage }) => {
           slog("llm.turn.finish", {
             connectionId: context.connection.id,
@@ -265,7 +309,22 @@ export class MyVoiceAgent extends VoiceAgent<Env> {
     // stale client, or a hand-typed ?tools=1 request that got tools attached
     // in the first place; and regardless of which model is in use, not just
     // the one currently known to have this problem.
-    return guardToolCallLeakStream(result.stream, async (leakedText) => {
+    const guardedStream = withFirstChunkTimeout(
+      result.stream,
+      STALL_TIMEOUT_MS,
+      () => {
+        serr("llm.turn.stalled", new Error(`no reply within ${STALL_TIMEOUT_MS}ms, cancelled`), {
+          connectionId: context.connection.id,
+          model: llmModel,
+        });
+        stall.abort();
+      },
+      { type: "text-delta", text: STALL_FALLBACK_REPLY } as never,
+      // Only actual words satisfy the deadline (see lib/stall-guard.ts).
+      (chunk) => (chunk as { type?: string }).type === "text-delta",
+    );
+
+    return guardToolCallLeakStream(guardedStream, async (leakedText) => {
       serr(
         "llm.tool_call_leak.suppressed",
         new Error("assistant text was a serialized tool call, not spoken/shown"),
@@ -291,7 +350,15 @@ export class MyVoiceAgent extends VoiceAgent<Env> {
 
   async onCallStart(connection: Connection) {
     slog("call.started", { connectionId: connection.id });
-    const messageCount = this.sql<{ count: number }>`SELECT COUNT(*) as count FROM cf_voice_messages`[0]?.count ?? 0;
+    // The history table doesn't exist until the first message is saved, so on
+    // a brand-new session this query used to throw "no such table:
+    // cf_voice_messages" and the whole call failed to start.
+    let messageCount = 0;
+    try {
+      messageCount = this.sql<{ count: number }>`SELECT COUNT(*) as count FROM cf_voice_messages`[0]?.count ?? 0;
+    } catch {
+      /* new session: no history yet */
+    }
     const greeting =
       messageCount > 0
         ? "Welcome back. How can I help?"

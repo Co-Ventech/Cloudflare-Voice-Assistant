@@ -61,3 +61,32 @@ describe("extractChunks", () => {
     expect(second.length).toBe(0);
   });
 });
+
+import { endsWithSentenceBoundary } from "../lib/tts-chunking";
+
+describe("a finished sentence at the very end of the buffer can start speaking immediately", () => {
+  it("accepts a clean sentence ending", () => {
+    expect(endsWithSentenceBoundary("I'm doing well, thanks for asking.")).toBe(true);
+    expect(endsWithSentenceBoundary("What can I do for you?")).toBe(true);
+    expect(endsWithSentenceBoundary("Great, that works!")).toBe(true);
+  });
+
+  it("does not treat abbreviations, decimals or ellipses as the end", () => {
+    expect(endsWithSentenceBoundary("Please ask Dr.")).toBe(false);
+    expect(endsWithSentenceBoundary("It costs about 3.")).toBe(false); // could be 3.5
+    expect(endsWithSentenceBoundary("Well, I was thinking...")).toBe(false);
+    expect(endsWithSentenceBoundary("Use e.g.")).toBe(false);
+  });
+
+  it("ignores text that is too short or has no terminator", () => {
+    expect(endsWithSentenceBoundary("Yes.")).toBe(false); // shorter than the minimum chunk
+    expect(endsWithSentenceBoundary("I am about to say")).toBe(false);
+    expect(endsWithSentenceBoundary("")).toBe(false);
+  });
+
+  it("extractChunks emits a complete short reply without waiting for the stream to end", () => {
+    const state = { buffer: "I'm doing well, thanks for asking.", emittedFirstChunk: false };
+    expect(extractChunks(state)).toEqual(["I'm doing well, thanks for asking."]);
+    expect(state.buffer).toBe("");
+  });
+});

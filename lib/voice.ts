@@ -26,17 +26,36 @@ export const TTS_MODEL = "@cf/deepgram/aura-1";
 // first token than the old default. "balanced" and "quality" stay selectable
 // for when the user wants noticeably better reasoning and is fine trading
 // ~1-2s of extra latency for it.
+// "deepseek" is DeepSeek's OWN API (api.deepseek.com), not the Cloudflare-hosted
+// copy. In testing it answered in ~0.7s to the first word with thinking switched
+// off, versus ~3s through Workers AI. It needs a DEEPSEEK_API_KEY secret; the
+// server falls back to the Cloudflare copy when there isn't one.
+export const DEEPSEEK_DIRECT_MODEL = "deepseek-flash";
+
 export const LLM_MODELS = {
   fastest: "@cf/meta/llama-3.2-1b-instruct",
+  deepseek: DEEPSEEK_DIRECT_MODEL,
   balanced: "@cf/deepseek-ai/deepseek-v4-flash-0731",
   quality: "@cf/openai/gpt-oss-20b",
 } as const;
 
 export type LlmKey = keyof typeof LLM_MODELS;
+// What the PAGE selects for someone who hasn't chosen yet. Kept separate from
+// DEFAULT_LLM (the server's fallback) on purpose: the server falls back to a
+// Cloudflare model, never to the direct DeepSeek API.
+export const DEFAULT_UI_LLM: LlmKey = "deepseek";
 export const DEFAULT_LLM: LlmKey = "fastest";
 
+/** True only for this app's own model keys. Uses an own-property check:
+ * `key in obj` is also true for inherited names such as "constructor" or
+ * "toString", which would let a hand-typed `?llm=constructor` resolve to a
+ * function instead of a model id. */
+export function isLlmKey(key: string | null | undefined): key is LlmKey {
+  return typeof key === "string" && Object.prototype.hasOwnProperty.call(LLM_MODELS, key);
+}
+
 export function resolveLlmModel(key: string | null | undefined): string {
-  if (key && key in LLM_MODELS) return LLM_MODELS[key as LlmKey];
+  if (isLlmKey(key)) return LLM_MODELS[key];
   return LLM_MODELS[DEFAULT_LLM];
 }
 
@@ -70,12 +89,13 @@ export function resolveLlmModel(key: string | null | undefined): string {
 // model it already knows can't use them (see resolveToolsEnabled below).
 export const LLM_TOOL_SUPPORT: Record<LlmKey, boolean> = {
   fastest: false,
+  deepseek: true,
   balanced: true,
   quality: true,
 };
 
 export function modelSupportsTools(key: string | null | undefined): boolean {
-  if (key && key in LLM_TOOL_SUPPORT) return LLM_TOOL_SUPPORT[key as LlmKey];
+  if (isLlmKey(key)) return LLM_TOOL_SUPPORT[key];
   return LLM_TOOL_SUPPORT[DEFAULT_LLM];
 }
 
@@ -95,6 +115,48 @@ export function resolveToolsEnabled(value: string | null | undefined, llmKey: st
   const requested = value === "1" || value === "true";
   if (!requested) return false;
   return modelSupportsTools(llmKey);
+}
+
+// Voice replies need to start quickly, and the time to first word grows with
+// the size of the prompt. The conversation is saved across sessions, so without
+// a cap every turn re-sends everything ever said (it reached 20 messages in
+// testing and DeepSeek replies went from ~1.3s to ~3.9s). Only the recent
+// turns matter for casual voice chat.
+export const MAX_LLM_HISTORY_MESSAGES = 12;
+// Spoken replies are 1-3 sentences; this is a guard against a long ramble, not
+// a target.
+export const MAX_REPLY_TOKENS = 256;
+
+export function limitHistory<T extends { role: string }>(messages: readonly T[], max: number): T[] {
+  if (messages.length <= max) return [...messages];
+  const recent = messages.slice(-max);
+  // Never start on an assistant message: drop leading replies until a user turn.
+  const firstUser = recent.findIndex((m) => m.role === "user");
+  return firstUser === -1 ? [] : recent.slice(firstUser);
+}
+
+export function usesDeepSeekDirect(key: string | null | undefined): boolean {
+  return key === "deepseek";
+}
+
+/** DeepSeek's switch for "don't think before answering" (provider options for
+ * @ai-sdk/deepseek). Thinking defaults to ON there; it costs seconds per reply. */
+export const DEEPSEEK_THINKING_OFF = { deepseek: { thinking: { type: "disabled" as const } } };
+
+// Reasoning ("thinking") settings per model. DeepSeek V4 Flash thinks at level
+// "high" by default (Cloudflare's model page: none | low | high (default) |
+// max). In a real call that meant ~7s of hidden reasoning before the first
+// word and 15s replies to "Hello?". A voice reply doesn't need it, so it is
+// switched off. `reasoning_effort: null` is the Workers AI provider's way of
+// saying "disable reasoning". GPT-OSS can't be fully switched off, so it gets
+// the lowest level. Llama has no reasoning mode, so nothing is sent.
+export type ReasoningSettings = { reasoning_effort?: "low" | "medium" | "high" | null };
+
+export function reasoningSettingsFor(key: string | null | undefined): ReasoningSettings {
+  if (!isLlmKey(key)) return {};
+  if (key === "balanced") return { reasoning_effort: null };
+  if (key === "quality") return { reasoning_effort: "low" };
+  return {};
 }
 
 export const SYSTEM_PROMPT =
@@ -127,7 +189,28 @@ const SPEAKER_IDS = new Set<string>(AURA_SPEAKERS.map((s) => s.id));
 
 /** Validates an untrusted speaker id (e.g. from a query string) against the
  * known Aura-1 speaker enum, falling back to the default on anything unknown. */
+export function isSpeakerId(value: string | null | undefined): value is AuraSpeakerId {
+  return typeof value === "string" && SPEAKER_IDS.has(value);
+}
+
 export function resolveSpeaker(value: string | null | undefined): AuraSpeakerId {
-  if (value && SPEAKER_IDS.has(value)) return value as AuraSpeakerId;
+  if (isSpeakerId(value)) return value;
   return DEFAULT_SPEAKER;
+}
+
+/** Human-readable duration for the spoken reminder confirmation, e.g.
+ * 90 -> "1 minute 30 seconds". (The old inline label rounded 90s up to
+ * "2 minutes".) */
+export function formatDelay(totalSeconds: number): string {
+  const s = Number.isFinite(totalSeconds) ? Math.max(0, Math.round(totalSeconds)) : 0;
+  const unit = (n: number, name: string) => `${n} ${name}${n === 1 ? "" : "s"}`;
+  if (s < 60) return unit(s, "second");
+  if (s < 3600) {
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return r === 0 ? unit(m, "minute") : `${unit(m, "minute")} ${unit(r, "second")}`;
+  }
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return m === 0 ? unit(h, "hour") : `${unit(h, "hour")} ${unit(m, "minute")}`;
 }
